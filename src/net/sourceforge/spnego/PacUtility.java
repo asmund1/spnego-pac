@@ -11,8 +11,10 @@ import java.util.StringTokenizer;
 public class PacUtility {
     // Shim function to adapt PAC string representation of byte array into other functions
     public static String binarySidToStringSid(String SID) {
-        // A SID is always 28 bytes - http://msdn.microsoft.com/en-us/library/cc221018%28v=PROT.13%29.aspx
-        byte[] bytes = new byte[28];
+        // A SID is max 28 bytes - http://msdn.microsoft.com/en-us/library/cc221018%28v=PROT.13%29.aspx
+        // However the RID/SubAuthority is a variable length list of 16 byte additional chunks
+        // https://msdn.microsoft.com/en-us/library/cc230371.aspx and https://msdn.microsoft.com/en-us/library/gg465313.aspx
+        byte[] bytes = new byte[SID.length() / 3];
         int byteNum = 0;
 
         // parse unsigned SID represented as \01\05\00\00\00\00\00\05\15\00\00\00\dc\2f\15\0b\e5\76\d3\8c\be\0b\4e\be\01\02\00\00

@@ -1,8 +1,13 @@
 SPNEGO PAC
 ------------
 
-Custom Spnego implementation the extracts roles from PAC using JaasLounge and 
-Bouncy Castle ASN1 libraries.
+Custom Spnego implementation the extracts roles from PAC using [JaasLounge](http://jaaslounge.sourceforge.net/) and 
+[Bouncy Castle](https://www.bouncycastle.org/) ASN1 libraries.
+
+JARS
+----
+
+the jars folder contains a jarcompiled from the current code as well as the Bouncy Castle library used.
 
 ACKNOWLEDGMENTS
 ---------------

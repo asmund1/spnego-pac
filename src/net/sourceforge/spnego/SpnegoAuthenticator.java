@@ -21,6 +21,8 @@ package net.sourceforge.spnego;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URISyntaxException;
+import java.security.Principal;
+import java.security.PrivilegedAction;
 import java.security.PrivilegedActionException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -51,13 +53,15 @@ import org.ietf.jgss.GSSContext;
 import org.ietf.jgss.GSSCredential;
 import org.ietf.jgss.GSSException;
 import org.ietf.jgss.GSSManager;
-import org.jaaslounge.decoding.DecodingException;
+import org.ietf.jgss.*;
 import org.jaaslounge.decoding.kerberos.KerberosAuthData;
 import org.jaaslounge.decoding.kerberos.KerberosPacAuthData;
 import org.jaaslounge.decoding.kerberos.KerberosToken;
 import org.jaaslounge.decoding.pac.PacLogonInfo;
 import org.jaaslounge.decoding.pac.PacSid;
 import org.jaaslounge.decoding.spnego.SpnegoInitToken;
+import sun.misc.BASE64Encoder;
+import sun.misc.HexDumpEncoder;
 
 /**
  * Handles <a href="http://en.wikipedia.org/wiki/SPNEGO">SPNEGO</a> or <a
@@ -163,6 +167,9 @@ public final class SpnegoAuthenticator {
         this.allowLocalhost = config.isLocalhostAllowed();
         this.promptIfNtlm = config.downgradeNtlm();
         this.allowDelegation = config.isDelegationAllowed();
+        
+        LOGGER.info("realm: " + System.getProperty("java.security.krb5.realm"));
+        LOGGER.info("kdc: " + System.getProperty("java.security.krb5.kdc"));
 
         if (config.useKeyTab()) {
             this.loginContext = new LoginContext(config.getServerLoginModule());
@@ -181,6 +188,8 @@ public final class SpnegoAuthenticator {
 
         this.serverPrincipal = new KerberosPrincipal(
                 this.serverCredentials.getName().toString());
+        
+        LOGGER.info("this.serverPrincipal: " + this.serverPrincipal.toString());
     }
     
     /**
@@ -302,7 +311,7 @@ public final class SpnegoAuthenticator {
         } else if (scheme.isBasicScheme()) {
             // check if we allow Basic Auth
             if (basicSupported) {
-                principal = doBasicAuth(scheme, resp);
+                principal = doBasicAuth(scheme, req, resp);
             } else {
                 LOGGER.severe("allowBasic=" + this.allowBasic 
                         + "; allowUnsecure=" + this.allowUnsecure
@@ -355,11 +364,15 @@ public final class SpnegoAuthenticator {
      * 
      * @return SpnegoPrincipal for the given auth scheme.
      */
-    private SpnegoPrincipal doBasicAuth(final SpnegoAuthScheme scheme
-        , final SpnegoHttpServletResponse resp) throws IOException {
+    private SpnegoPrincipal doBasicAuth(final SpnegoAuthScheme scheme, 
+            final HttpServletRequest req, 
+            final SpnegoHttpServletResponse resp) throws IOException {
 
         final byte[] data = scheme.getToken();
-
+        
+        // RICKY
+        List<String> sids = null;
+        
         if (0 == data.length) {
             LOGGER.finer("Basic Auth data was NULL.");
             return null;
@@ -382,22 +395,103 @@ public final class SpnegoAuthenticator {
         
         SpnegoPrincipal principal = null;
         
+        LoginContext cntxt = null;
         try {
             // assert
             if (null == username || username.isEmpty()) {
                 throw new LoginException("Username is required.");
             }
-
-            final LoginContext cntxt = new LoginContext(this.clientModuleName, handler);
-
-            // validate username/password by login/logout  
+            
+            // Get Ticket Granting Ticket (TGT) from KDC using username and password
+            cntxt = new LoginContext(this.clientModuleName, handler);
             cntxt.login();
+            Subject subject = cntxt.getSubject();
+
+            // extract our principal
+            final Set<Principal> principalSet = subject.getPrincipals();
+            if (principalSet.size() != 1) {
+                throw new AssertionError("No or several principals: " + principalSet);
+            }
+            final Principal userPrincipal = principalSet.iterator().next();
+
+            // Get Service ticket/Kerberos Token for this server using users TGT
+            final TicketCreatorAction action = new TicketCreatorAction(userPrincipal.getName(), this.serverPrincipal.toString());//"HTTP/RES-DB02.domain.local"
+            //final StringBuffer outputBuffer = new StringBuffer();
+            //action.setOutputBuffer(outputBuffer);
+            Subject.doAsPrivileged(cntxt.getSubject(), action, null);
+            //LOGGER.info(outputBuffer.toString());
+            final byte[] token = action.getToken();
+
+            if (0 == token.length) {
+                LOGGER.finer("Kerberos token was NULL.");
+                return null;
+            }
+            //LOGGER.info("GSS: " + (new String(gss)));
+            //LOGGER.info("Kerberos token HEX: " + (new HexDumpEncoder()).encodeBuffer(token));
+
+            try {
+                // RICKY: let's try to get SIDs from the PAC extension
+                //        it is just done the first time, then it is ommited
+                //        and recovered from the session
+                HttpSession sess = req.getSession(true);
+                if (sess.getAttribute(SIDS_SESSION_ATTR) != null) {
+                    LOGGER.finer("Recovering SIDs from the session!");
+                    sids = (List<String>) sess.getAttribute(SIDS_SESSION_ATTR);
+                } else {
+                    LOGGER.finer("First time! Let's parse the kerberos token...");
+                    sids = new ArrayList<String>();
+                    // get the server credential from the service account subject
+                    Set<KerberosKey> creds = this.loginContext.getSubject().getPrivateCredentials(KerberosKey.class);
+                    KerberosKey[] keys = creds.toArray(new KerberosKey[creds.size()]);
+                    // parse the kerberos token
+                    KerberosToken kerberosToken = new KerberosToken(token, keys);
+                    // get all the autorizations
+                    List<KerberosAuthData> authorizations = kerberosToken.getTicket().getEncData().getUserAuthorizations();
+                    for (KerberosAuthData authorization : authorizations) {
+                        // get the PAC info
+                        PacLogonInfo logonInfo = ((KerberosPacAuthData) authorization).getPac().getLogonInfo();
+                        if (logonInfo != null) {
+                            if (logonInfo.getGroupSid() != null) {
+                                String sid = PacUtility.binarySidToStringSid(logonInfo.getGroupSid().toString());
+                                LOGGER.log(Level.FINER, "Adding primary group SID: {0}", sid);
+                                sids.add(sid);
+                            }
+                            if (logonInfo.getGroupSids() != null) {
+                                for (PacSid pacSid : logonInfo.getGroupSids()) {
+                                    String sid = PacUtility.binarySidToStringSid(pacSid.toString());
+                                    LOGGER.log(Level.FINER, "Adding secondary group SID: {0}", sid);
+                                    sids.add(sid);
+                                }
+                            }
+                            if (logonInfo.getExtraSids() != null) {
+                                for (PacSid pacSid : logonInfo.getExtraSids()) {
+                                    String sid = PacUtility.binarySidToStringSid(pacSid.toString());
+                                    LOGGER.log(Level.FINER, "Adding extra group SID: {0}", sid);
+                                    sids.add(sid);
+                                }
+                            }
+                            if (logonInfo.getResourceGroupSids() != null) {
+                                for (PacSid pacSid : logonInfo.getResourceGroupSids()) {
+                                    String sid = PacUtility.binarySidToStringSid(pacSid.toString());
+                                    LOGGER.log(Level.FINER, "Adding resource group SID: {0}", sid);
+                                    sids.add(sid);
+                                }
+                            }
+                        }
+                    }
+                    sess.setAttribute(SIDS_SESSION_ATTR, sids);
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+                if (sids == null) {
+                    sids = new ArrayList<String>();
+                }
+            }
+            // END RICKY
+
             cntxt.logout();
-
-            principal = new SpnegoPrincipal(username + '@' 
-                    + this.serverPrincipal.getRealm()
-                    , KerberosPrincipal.KRB_NT_PRINCIPAL);
-
+            
+            principal = new SpnegoPrincipal(username + '@' + this.serverPrincipal.getRealm(), KerberosPrincipal.KRB_NT_PRINCIPAL, sids);
         } catch (LoginException le) {
             LOGGER.info(le.getMessage() + ": Login failed. username=" + username 
                     + "; password.hashCode()=" + password.hashCode());
@@ -449,6 +543,9 @@ public final class SpnegoAuthenticator {
             LOGGER.finer("GSS data was NULL.");
             return null;
         }
+        //LOGGER.info("GSS: " + (new String(gss)));
+        //LOGGER.info("GSS HEX: " + (new HexDumpEncoder()).encodeBuffer(gss));
+        //LOGGER.info("GSS base64: " + Base64.encode(gss));
 
         GSSContext context = null;
         GSSCredential delegCred = null;
@@ -484,6 +581,7 @@ public final class SpnegoAuthenticator {
                     // create the parser SPNEGO token
                     SpnegoInitToken spnegoToken = new SpnegoInitToken(gss);
                     byte[] mechanismToken = spnegoToken.getMechanismToken();
+                    //LOGGER.info("mechanismToken: " + new String(mechanismToken));
                     // get the server credential from the service account subject
                     Set<KerberosKey> creds = this.loginContext.getSubject().getPrivateCredentials(KerberosKey.class);
                     KerberosKey[] keys = creds.toArray(new KerberosKey[creds.size()]);
@@ -569,5 +667,97 @@ public final class SpnegoAuthenticator {
         
         return req.getLocalAddr().equals(req.getRemoteAddr());
     }
+
+    /**
+     * Functions to fetch Service Ticket using Ticket Granting Ticket
+     */
+    private final static Oid KERB_V5_OID;
+    private final static Oid KRB5_PRINCIPAL_NAME_OID;
+
+    static {
+        try {
+            KERB_V5_OID = new Oid("1.2.840.113554.1.2.2");
+            KRB5_PRINCIPAL_NAME_OID = new Oid("1.2.840.113554.1.2.2.1");
+
+        } catch (final GSSException ex) {
+            throw new Error(ex);
+        }
+    }
     
+    private static class TicketCreatorAction implements PrivilegedAction<Object> {
+        final String userPrincipal;
+        final String applicationPrincipal;
+        GSSName srcName;
+        GSSName targetName;
+        byte[] token;
+
+        private StringBuffer outputBuffer;
+
+        /**
+         *
+         * @param userPrincipal  p.ex. <tt>MuelleHA@MYFIRM.COM</tt>
+         * @param applicationPrincipal  p.ex. <tt>HTTP/webserver.myfirm.com</tt>
+         */
+        private TicketCreatorAction(final String userPrincipal, final String applicationPrincipal) {
+            this.userPrincipal = userPrincipal;
+            this.applicationPrincipal = applicationPrincipal;
+        }
+
+        private void setOutputBuffer(final StringBuffer newOutputBuffer) {
+            outputBuffer = newOutputBuffer;
+        }
+        
+        private byte[] getToken() {
+            return this.token;
+        }
+
+        /**
+         * Only calls {@link #createTicket()}
+         * @return <tt>null</tt>
+         */
+        public Object run() {
+            try {
+                createTicket();
+            } catch (final GSSException  ex) {
+                throw new Error(ex);
+            }
+            return null;
+        }
+
+        /**
+         *
+         * @throws GSSException
+         */
+        private void createTicket () throws GSSException {
+            final GSSManager manager = GSSManager.getInstance();
+            final GSSName clientName = manager.createName(userPrincipal, KRB5_PRINCIPAL_NAME_OID);
+            final GSSCredential clientCred = manager.createCredential(clientName,
+                    8 * 3600,
+                    KERB_V5_OID,
+                    GSSCredential.INITIATE_ONLY);
+
+            final GSSName serverName = manager.createName(applicationPrincipal, KRB5_PRINCIPAL_NAME_OID); // GSSName.NT_HOSTBASED_SERVICE
+
+            final GSSContext context = manager.createContext(serverName,
+                    KERB_V5_OID,
+                    clientCred,
+                    GSSContext.DEFAULT_LIFETIME);
+            context.requestMutualAuth(true);
+            context.requestConf(false);
+            context.requestInteg(true);
+
+            token = context.initSecContext(new byte[0], 0, 0);
+            srcName = context.getSrcName();
+            targetName = context.getTargName();
+            
+            if (outputBuffer !=null) {
+                outputBuffer.append(String.format("Src Name: %s\n", srcName));
+                outputBuffer.append(String.format("Target Name: %s\n", targetName));
+                outputBuffer.append(new BASE64Encoder().encode(token));
+                outputBuffer.append("\n");
+            }
+
+            context.dispose();
+        }
+    }
 }

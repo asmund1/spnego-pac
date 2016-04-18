@@ -74,6 +74,13 @@ public final class SpnegoPrincipal implements Principal {
         // RICKY
         this.sids = new ArrayList<String>();
     }
+    
+    // RICKY - ASMUND
+    public SpnegoPrincipal(final String name, final int nameType, List<String> sids) {
+        this.kerberosPrincipal = new KerberosPrincipal(name, nameType);
+        this.delegatedCred = null;
+        this.sids = sids;
+    }
 
     /**
      * Constructs a SpnegoPrincipal from the provided String input 
